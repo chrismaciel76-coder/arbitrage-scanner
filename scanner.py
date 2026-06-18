@@ -8,9 +8,13 @@ MIN_SPREAD = 1
 MAX_SPREAD = 100
 SCAN_INTERVAL = 15
 
-gate = ccxt.gateio({"enableRateLimit": True})
-mexc = ccxt.mexc({"enableRateLimit": True})
-bingx = ccxt.bingx({"enableRateLimit": True})
+def create_exchange(exchange_id):
+    exchange_class = getattr(ccxt, exchange_id)
+    return exchange_class({"enableRateLimit": True})
+
+gate = create_exchange("gate")
+mexc = create_exchange("mexc")
+bingx = create_exchange("bingx")
 
 data = []
 
@@ -29,15 +33,19 @@ def load_pairs():
     for name, ex in exchanges.items():
         try:
             markets = ex.load_markets()
+
             spot[name] = [
                 s for s, m in markets.items()
                 if "/USDT" in s and m.get("spot") is True
             ]
+
             fut[name] = [
                 s for s, m in markets.items()
                 if "/USDT" in s and (m.get("swap") is True or m.get("future") is True)
             ]
+
             print(name, "spot:", len(spot[name]), "futuros:", len(fut[name]))
+
         except Exception as e:
             print("Erro ao carregar", name, e)
             spot[name] = []
@@ -56,14 +64,20 @@ def get_price(exchange, pair):
     try:
         ticker = exchange.fetch_ticker(pair)
         price = ticker.get("last")
+
         if price is None or price <= 0:
             return None
+
         return float(price)
-    except:
+
+    except Exception:
         return None
 
+def clean_symbol(pair):
+    return pair.replace("/", "_").replace(":USDT", "")
+
 def make_link(exchange_name, market_type, pair):
-    symbol = pair.replace("/", "_").replace(":USDT", "")
+    symbol = clean_symbol(pair)
 
     if exchange_name == "Gate" and market_type == "SPOT":
         return f"https://www.gate.io/trade/{symbol}"
@@ -95,14 +109,15 @@ def scanner():
             prices = {}
 
             for name, ex in exchanges.items():
+
                 if pair in spot_pairs[name]:
                     price = get_price(ex, pair)
-                    if price:
+                    if price is not None and price > 0:
                         prices[f"{name} SPOT"] = price
 
                 if pair in fut_pairs[name]:
                     price = get_price(ex, pair)
-                    if price:
+                    if price is not None and price > 0:
                         prices[f"{name} FUT"] = price
 
             valid_prices = {
@@ -121,7 +136,7 @@ def scanner():
 
             spread = (sell_price - buy_price) / buy_price * 100
 
-            if not (MIN_SPREAD <= spread <= MAX_SPREAD):
+            if spread < MIN_SPREAD or spread > MAX_SPREAD:
                 continue
 
             if "SPOT" in buy_ex and "FUT" in sell_ex:
@@ -148,8 +163,7 @@ def scanner():
                 "sell_link": make_link(sell_name, sell_market, pair),
             })
 
-        results = sorted(results, key=lambda x: x["spread"], reverse=True)
-        data = results
+        data = sorted(results, key=lambda x: x["spread"], reverse=True)
         time.sleep(SCAN_INTERVAL)
 
 app = Flask(__name__)
@@ -161,17 +175,44 @@ HTML = """
     <title>Scanner Arbitragem</title>
     <meta http-equiv="refresh" content="15">
     <style>
-        body { font-family: Arial; padding: 20px; background: #111; color: white; }
-        table { width: 100%; border-collapse: collapse; background: #1c1c1c; }
-        th, td { border: 1px solid #333; padding: 8px; text-align: center; }
-        th { background: #222; color: #00ff99; }
-        a { color: #00ccff; font-weight: bold; }
-        .high { color: #ff4d4d; font-weight: bold; }
+        body {
+            font-family: Arial;
+            padding: 20px;
+            background: #111;
+            color: white;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: #1c1c1c;
+        }
+        th, td {
+            border: 1px solid #333;
+            padding: 8px;
+            text-align: center;
+        }
+        th {
+            background: #222;
+            color: #00ff99;
+        }
+        a {
+            color: #00ccff;
+            font-weight: bold;
+        }
+        .spread {
+            color: #ff4d4d;
+            font-weight: bold;
+        }
     </style>
 </head>
 <body>
     <h2>Scanner Arbitragem — Spot x Futures / Futures x Futures</h2>
-    <p>Spread: {{min_spread}}% até {{max_spread}}% | Atualiza a cada {{interval}} segundos</p>
+
+    <p>
+        Spread: {{min_spread}}% até {{max_spread}}% |
+        Atualiza a cada {{interval}} segundos
+    </p>
+
     <p>Oportunidades encontradas: {{data|length}}</p>
 
     <table>
@@ -194,7 +235,7 @@ HTML = """
             <td>{{r.sell}}</td>
             <td>{{r.buy_price}}</td>
             <td>{{r.sell_price}}</td>
-            <td class="high">{{r.spread}}%</td>
+            <td class="spread">{{r.spread}}%</td>
             <td>
                 <a href="{{r.buy_link}}" target="_blank">BUY</a>
                 |
@@ -220,4 +261,5 @@ def index():
 threading.Thread(target=scanner, daemon=True).start()
 
 port = int(os.environ.get("PORT", 5000))
+
 app.run(host="0.0.0.0", port=port)

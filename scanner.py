@@ -1,29 +1,49 @@
 import os, time, threading, ccxt
 from flask import Flask, render_template_string, request
 
-MIN_SPREAD = 1
-MAX_SPREAD = 100
-SCAN_INTERVAL = 30
+SCAN_INTERVAL = 10
 
-EXCHANGE_IDS = {"Gate": "gate", "MEXC": "mexc", "BingX": "bingx"}
+DEFAULT_MIN_SPREAD = 1
+DEFAULT_MAX_SPREAD = 100
+DEFAULT_MIN_LIQUIDITY = 100000
+SPREAD_SAIDA_ALVO = 0.30
+
+EXCHANGE_IDS = {
+    "Gate": "gate",
+    "MEXC": "mexc",
+    "BingX": "bingx",
+}
 
 data = []
-status = {"last_update": "A iniciar...", "errors": [], "counts": {}}
+status = {
+    "last_update": "A iniciar...",
+    "errors": [],
+    "counts": {}
+}
 
 def create_exchange(exchange_id):
-    cls = getattr(ccxt, exchange_id)
-    return cls({"enableRateLimit": True, "timeout": 20000})
+    exchange_class = getattr(ccxt, exchange_id)
+    return exchange_class({
+        "enableRateLimit": True,
+        "timeout": 20000
+    })
 
-exchanges = {name: create_exchange(eid) for name, eid in EXCHANGE_IDS.items()}
+exchanges = {
+    name: create_exchange(exchange_id)
+    for name, exchange_id in EXCHANGE_IDS.items()
+}
 
 def normalize_key(market):
     base = market.get("base")
     quote = market.get("quote")
     settle = market.get("settle")
+
     if not base:
         return None
+
     if quote == "USDT" or settle == "USDT":
         return f"{base}/USDT"
+
     return None
 
 def is_spot(market):
@@ -34,31 +54,48 @@ def is_fut(market):
         market.get("swap") is True
         or market.get("future") is True
         or market.get("contract") is True
-    ) and (market.get("quote") == "USDT" or market.get("settle") == "USDT")
+    ) and (
+        market.get("quote") == "USDT"
+        or market.get("settle") == "USDT"
+    )
 
 def load_markets_map():
     market_map = {}
     counts = {}
-    for ex_name, ex in exchanges.items():
-        market_map[ex_name] = {"SPOT": {}, "FUT": {}}
+
+    for exchange_name, exchange in exchanges.items():
+        market_map[exchange_name] = {
+            "SPOT": {},
+            "FUT": {}
+        }
+
         try:
-            markets = ex.load_markets()
+            markets = exchange.load_markets()
+
             for symbol, market in markets.items():
                 key = normalize_key(market)
+
                 if not key:
                     continue
-                if is_spot(market):
-                    market_map[ex_name]["SPOT"][key] = symbol
-                if is_fut(market):
-                    market_map[ex_name]["FUT"][key] = symbol
 
-            counts[ex_name] = {
-                "spot": len(market_map[ex_name]["SPOT"]),
-                "fut": len(market_map[ex_name]["FUT"]),
+                if is_spot(market):
+                    market_map[exchange_name]["SPOT"][key] = symbol
+
+                if is_fut(market):
+                    market_map[exchange_name]["FUT"][key] = symbol
+
+            counts[exchange_name] = {
+                "spot": len(market_map[exchange_name]["SPOT"]),
+                "fut": len(market_map[exchange_name]["FUT"]),
             }
+
         except Exception as e:
-            counts[ex_name] = {"spot": 0, "fut": 0}
-            status["errors"].append(f"{ex_name}: {e}")
+            counts[exchange_name] = {
+                "spot": 0,
+                "fut": 0
+            }
+            status["errors"].append(f"Erro ao carregar mercados {exchange_name}: {e}")
+
     status["counts"] = counts
     return market_map
 
@@ -73,65 +110,97 @@ def safe_fetch_tickers(exchange, symbols):
         except Exception:
             return {}
 
+def get_liquidity_from_ticker(ticker):
+    quote_volume = ticker.get("quoteVolume")
+
+    if quote_volume is not None:
+        try:
+            return float(quote_volume)
+        except Exception:
+            return 0
+
+    base_volume = ticker.get("baseVolume")
+    last_price = ticker.get("last")
+
+    try:
+        if base_volume and last_price:
+            return float(base_volume) * float(last_price)
+    except Exception:
+        return 0
+
+    return 0
+
 def get_all_prices():
     prices = {}
-    for ex_name, ex in exchanges.items():
-        spot_symbols = list(market_map[ex_name]["SPOT"].values())
-        fut_symbols = list(market_map[ex_name]["FUT"].values())
 
-        spot_tickers = safe_fetch_tickers(ex, spot_symbols)
-        fut_tickers = safe_fetch_tickers(ex, fut_symbols)
+    for exchange_name, exchange in exchanges.items():
+        spot_symbols = list(market_map[exchange_name]["SPOT"].values())
+        fut_symbols = list(market_map[exchange_name]["FUT"].values())
 
-        for key, symbol in market_map[ex_name]["SPOT"].items():
+        spot_tickers = safe_fetch_tickers(exchange, spot_symbols)
+        fut_tickers = safe_fetch_tickers(exchange, fut_symbols)
+
+        for key, symbol in market_map[exchange_name]["SPOT"].items():
             ticker = spot_tickers.get(symbol, {})
             price = ticker.get("last")
+            liquidity = get_liquidity_from_ticker(ticker)
+
             if price and price > 0:
                 prices.setdefault(key, []).append({
-                    "exchange": ex_name,
+                    "exchange": exchange_name,
                     "market": "SPOT",
-                    "label": f"{ex_name} SPOT",
+                    "label": f"{exchange_name} SPOT",
                     "symbol": symbol,
                     "price": float(price),
+                    "liquidity": float(liquidity),
                 })
 
-        for key, symbol in market_map[ex_name]["FUT"].items():
+        for key, symbol in market_map[exchange_name]["FUT"].items():
             ticker = fut_tickers.get(symbol, {})
             price = ticker.get("last")
+            liquidity = get_liquidity_from_ticker(ticker)
+
             if price and price > 0:
                 prices.setdefault(key, []).append({
-                    "exchange": ex_name,
+                    "exchange": exchange_name,
                     "market": "FUT",
-                    "label": f"{ex_name} FUT",
+                    "label": f"{exchange_name} FUT",
                     "symbol": symbol,
                     "price": float(price),
+                    "liquidity": float(liquidity),
                 })
+
     return prices
 
 def clean_symbol(symbol):
     return symbol.replace("/", "_").replace(":USDT", "")
 
 def make_link(exchange, market, symbol):
-    s = clean_symbol(symbol)
+    symbol_clean = clean_symbol(symbol)
 
     if exchange == "Gate" and market == "SPOT":
-        return f"https://www.gate.io/trade/{s}"
+        return f"https://www.gate.io/trade/{symbol_clean}"
+
     if exchange == "Gate" and market == "FUT":
-        return f"https://www.gate.io/futures_trade/{s}"
+        return f"https://www.gate.io/futures_trade/{symbol_clean}"
 
     if exchange == "MEXC" and market == "SPOT":
-        return f"https://www.mexc.com/exchange/{s}"
+        return f"https://www.mexc.com/exchange/{symbol_clean}"
+
     if exchange == "MEXC" and market == "FUT":
-        return f"https://www.mexc.com/futures/{s}"
+        return f"https://www.mexc.com/futures/{symbol_clean}"
 
     if exchange == "BingX" and market == "SPOT":
-        return f"https://bingx.com/en-us/spot/{s}"
+        return f"https://bingx.com/en-us/spot/{symbol_clean}"
+
     if exchange == "BingX" and market == "FUT":
-        return f"https://bingx.com/en-us/perpetual/{s}"
+        return f"https://bingx.com/en-us/perpetual/{symbol_clean}"
 
     return "#"
 
 def scanner():
     global data
+
     while True:
         results = []
         status["errors"] = []
@@ -150,27 +219,38 @@ def scanner():
 
                         if buy["market"] == "SPOT" and sell["market"] == "FUT":
                             arb_type = "SPOT x FUT"
+
                         elif buy["market"] == "FUT" and sell["market"] == "FUT":
                             arb_type = "FUT x FUT"
+
                         else:
                             continue
 
                         spread = (sell["price"] - buy["price"]) / buy["price"] * 100
 
-                        if MIN_SPREAD <= spread <= MAX_SPREAD:
-                            results.append({
-                                "pair": pair,
-                                "type": arb_type,
-                                "buy": buy["label"],
-                                "sell": sell["label"],
-                                "buy_price": round(buy["price"], 8),
-                                "sell_price": round(sell["price"], 8),
-                                "spread": round(spread, 2),
-                                "buy_link": make_link(buy["exchange"], buy["market"], buy["symbol"]),
-                                "sell_link": make_link(sell["exchange"], sell["market"], sell["symbol"]),
-                            })
+                        if spread <= 0:
+                            continue
 
-            data = sorted(results, key=lambda x: x["spread"], reverse=True)
+                        min_liquidity = min(
+                            buy.get("liquidity", 0),
+                            sell.get("liquidity", 0)
+                        )
+
+                        results.append({
+                            "pair": pair,
+                            "type": arb_type,
+                            "buy": buy["label"],
+                            "sell": sell["label"],
+                            "buy_price": round(buy["price"], 8),
+                            "sell_price": round(sell["price"], 8),
+                            "spread_abertura": round(spread, 2),
+                            "spread_saida": SPREAD_SAIDA_ALVO,
+                            "liquidity": round(min_liquidity, 2),
+                            "buy_link": make_link(buy["exchange"], buy["market"], buy["symbol"]),
+                            "sell_link": make_link(sell["exchange"], sell["market"], sell["symbol"]),
+                        })
+
+            data = sorted(results, key=lambda x: x["spread_abertura"], reverse=True)
             status["last_update"] = time.strftime("%Y-%m-%d %H:%M:%S")
 
         except Exception as e:
@@ -185,7 +265,7 @@ HTML = """
 <html>
 <head>
     <title>Arbitrage Scanner</title>
-    <meta http-equiv="refresh" content="30">
+    <meta http-equiv="refresh" content="10">
     <style>
         body {
             margin: 0;
@@ -225,12 +305,13 @@ HTML = """
             font-size: 13px;
         }
         .card-value {
-            font-size: 22px;
+            font-size: 21px;
             margin-top: 6px;
             font-weight: bold;
         }
         .filters {
             padding: 0 20px 20px 20px;
+            background: #0b0f19;
         }
         select, input {
             background: #111827;
@@ -238,7 +319,16 @@ HTML = """
             border: 1px solid #374151;
             padding: 8px;
             border-radius: 6px;
-            margin-right: 8px;
+            margin: 4px;
+        }
+        button {
+            background: #00cc88;
+            border: none;
+            color: #001b12;
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-weight: bold;
+            cursor: pointer;
         }
         table {
             width: calc(100% - 40px);
@@ -281,19 +371,18 @@ HTML = """
             font-weight: bold;
             font-size: 16px;
         }
+        .saida {
+            color: #fbbf24;
+            font-weight: bold;
+        }
+        .liq {
+            color: #93c5fd;
+            font-weight: bold;
+        }
         a {
             color: #38bdf8;
             text-decoration: none;
             font-weight: bold;
-        }
-        button {
-            background: #00cc88;
-            border: none;
-            color: #001b12;
-            padding: 7px 10px;
-            border-radius: 6px;
-            font-weight: bold;
-            cursor: pointer;
         }
         .empty {
             margin: 20px;
@@ -316,6 +405,7 @@ HTML = """
     </script>
 </head>
 <body>
+
     <div class="header">
         <div class="title">Arbitrage Scanner</div>
         <div class="subtitle">Gate.io · MEXC · BingX | Spot x Futures / Futures x Futures</div>
@@ -323,8 +413,13 @@ HTML = """
 
     <div class="cards">
         <div class="card">
-            <div class="card-title">Oportunidades</div>
+            <div class="card-title">Oportunidades filtradas</div>
             <div class="card-value">{{filtered|length}}</div>
+        </div>
+
+        <div class="card">
+            <div class="card-title">Total bruto</div>
+            <div class="card-value">{{total_data}}</div>
         </div>
 
         <div class="card">
@@ -333,8 +428,8 @@ HTML = """
         </div>
 
         <div class="card">
-            <div class="card-title">Spread</div>
-            <div class="card-value">{{min_spread}}% - {{max_spread}}%</div>
+            <div class="card-title">Intervalo</div>
+            <div class="card-value">{{interval}}s</div>
         </div>
 
         {% for ex, c in status.counts.items() %}
@@ -346,6 +441,10 @@ HTML = """
     </div>
 
     <form class="filters" method="get">
+        <input name="min_spread" type="number" step="0.01" placeholder="Spread mínimo %" value="{{min_spread}}">
+        <input name="max_spread" type="number" step="0.01" placeholder="Spread máximo %" value="{{max_spread}}">
+        <input name="min_liquidity" type="number" step="1" placeholder="Liquidez mínima USDT" value="{{min_liquidity}}">
+
         <select name="type">
             <option value="">Todos os tipos</option>
             <option value="SPOT x FUT" {% if selected_type == "SPOT x FUT" %}selected{% endif %}>SPOT x FUT</option>
@@ -359,8 +458,9 @@ HTML = """
             <option value="BingX" {% if selected_exchange == "BingX" %}selected{% endif %}>BingX</option>
         </select>
 
-        <input name="pair" placeholder="Filtrar par ex: BTC" value="{{selected_pair}}">
-        <button type="submit">Filtrar</button>
+        <input name="pair" placeholder="Filtrar par: BTC, ETH, PEPE..." value="{{selected_pair}}">
+
+        <button type="submit">Aplicar filtros</button>
     </form>
 
     {% if status.errors %}
@@ -369,7 +469,8 @@ HTML = """
 
     {% if filtered|length == 0 %}
         <div class="empty">
-            Nenhuma oportunidade encontrada neste momento. O scanner está ativo e continuará atualizando.
+            Nenhuma oportunidade encontrada com estes filtros.
+            Tente reduzir a liquidez mínima ou baixar o spread mínimo.
         </div>
     {% endif %}
 
@@ -381,13 +482,16 @@ HTML = """
             <th>Vender</th>
             <th>Preço Compra</th>
             <th>Preço Venda</th>
-            <th>Spread</th>
+            <th>Spread Abertura</th>
+            <th>Spread Saída</th>
+            <th>Liquidez USDT</th>
             <th>Ações</th>
         </tr>
 
         {% for r in filtered %}
         <tr>
             <td><b>{{r.pair}}</b></td>
+
             <td>
                 {% if r.type == "SPOT x FUT" %}
                     <span class="badge spotfut">{{r.type}}</span>
@@ -395,11 +499,15 @@ HTML = """
                     <span class="badge futfut">{{r.type}}</span>
                 {% endif %}
             </td>
+
             <td>{{r.buy}}</td>
             <td>{{r.sell}}</td>
             <td>{{r.buy_price}}</td>
             <td>{{r.sell_price}}</td>
-            <td class="spread">{{r.spread}}%</td>
+            <td class="spread">{{r.spread_abertura}}%</td>
+            <td class="saida">{{r.spread_saida}}%</td>
+            <td class="liq">{{r.liquidity}}</td>
+
             <td>
                 <a href="{{r.buy_link}}" target="_blank">BUY</a>
                 |
@@ -410,20 +518,47 @@ HTML = """
         </tr>
         {% endfor %}
     </table>
+
 </body>
 </html>
 """
 
+def get_float_param(name, default):
+    try:
+        value = request.args.get(name, "")
+        if value == "":
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
 @app.route("/")
 def index():
+    min_spread = get_float_param("min_spread", DEFAULT_MIN_SPREAD)
+    max_spread = get_float_param("max_spread", DEFAULT_MAX_SPREAD)
+    min_liquidity = get_float_param("min_liquidity", DEFAULT_MIN_LIQUIDITY)
+
     selected_type = request.args.get("type", "")
     selected_exchange = request.args.get("exchange", "")
     selected_pair = request.args.get("pair", "").upper().strip()
 
     filtered = data
 
+    filtered = [
+        r for r in filtered
+        if min_spread <= r["spread_abertura"] <= max_spread
+    ]
+
+    filtered = [
+        r for r in filtered
+        if r["liquidity"] >= min_liquidity
+    ]
+
     if selected_type:
-        filtered = [r for r in filtered if r["type"] == selected_type]
+        filtered = [
+            r for r in filtered
+            if r["type"] == selected_type
+        ]
 
     if selected_exchange:
         filtered = [
@@ -432,14 +567,20 @@ def index():
         ]
 
     if selected_pair:
-        filtered = [r for r in filtered if selected_pair in r["pair"].upper()]
+        filtered = [
+            r for r in filtered
+            if selected_pair in r["pair"].upper()
+        ]
 
     return render_template_string(
         HTML,
         filtered=filtered,
+        total_data=len(data),
         status=status,
-        min_spread=MIN_SPREAD,
-        max_spread=MAX_SPREAD,
+        interval=SCAN_INTERVAL,
+        min_spread=min_spread,
+        max_spread=max_spread,
+        min_liquidity=min_liquidity,
         selected_type=selected_type,
         selected_exchange=selected_exchange,
         selected_pair=selected_pair

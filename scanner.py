@@ -1,101 +1,142 @@
-import os
-import time
-import threading
-import ccxt
+import os, time, threading, ccxt
 from flask import Flask, render_template_string
 
 MIN_SPREAD = 1
 MAX_SPREAD = 100
-SCAN_INTERVAL = 15
+SCAN_INTERVAL = 30
 
-def create_exchange(exchange_id):
-    exchange_class = getattr(ccxt, exchange_id)
-    return exchange_class({"enableRateLimit": True})
-
-gate = create_exchange("gate")
-mexc = create_exchange("mexc")
-bingx = create_exchange("bingx")
+EXCHANGE_IDS = {
+    "Gate": "gate",
+    "MEXC": "mexc",
+    "BingX": "bingx",
+}
 
 data = []
+status = {"last_update": "A iniciar...", "errors": [], "counts": {}}
 
-def load_pairs():
-    print("Carregando mercados...")
+def create_exchange(exchange_id):
+    cls = getattr(ccxt, exchange_id)
+    return cls({"enableRateLimit": True, "timeout": 20000})
 
-    exchanges = {
-        "Gate": gate,
-        "MEXC": mexc,
-        "BingX": bingx
-    }
+exchanges = {name: create_exchange(eid) for name, eid in EXCHANGE_IDS.items()}
 
-    spot = {}
-    fut = {}
+def normalize_key(market):
+    base = market.get("base")
+    quote = market.get("quote")
+    settle = market.get("settle")
+    if not base:
+        return None
+    if quote == "USDT" or settle == "USDT":
+        return f"{base}/USDT"
+    return None
 
-    for name, ex in exchanges.items():
+def is_spot(market):
+    return market.get("spot") is True and market.get("quote") == "USDT"
+
+def is_fut(market):
+    return (market.get("swap") is True or market.get("future") is True or market.get("contract") is True) and (
+        market.get("quote") == "USDT" or market.get("settle") == "USDT"
+    )
+
+def load_markets_map():
+    market_map = {}
+    counts = {}
+
+    for ex_name, ex in exchanges.items():
+        market_map[ex_name] = {"SPOT": {}, "FUT": {}}
+
         try:
             markets = ex.load_markets()
+            for symbol, market in markets.items():
+                key = normalize_key(market)
+                if not key:
+                    continue
 
-            spot[name] = [
-                s for s, m in markets.items()
-                if "/USDT" in s and m.get("spot") is True
-            ]
+                if is_spot(market):
+                    market_map[ex_name]["SPOT"][key] = symbol
 
-            fut[name] = [
-                s for s, m in markets.items()
-                if "/USDT" in s and (m.get("swap") is True or m.get("future") is True)
-            ]
+                if is_fut(market):
+                    market_map[ex_name]["FUT"][key] = symbol
 
-            print(name, "spot:", len(spot[name]), "futuros:", len(fut[name]))
+            counts[ex_name] = {
+                "spot": len(market_map[ex_name]["SPOT"]),
+                "fut": len(market_map[ex_name]["FUT"]),
+            }
 
         except Exception as e:
-            print("Erro ao carregar", name, e)
-            spot[name] = []
-            fut[name] = []
+            counts[ex_name] = {"spot": 0, "fut": 0}
+            status["errors"].append(f"Erro mercados {ex_name}: {e}")
 
-    all_pairs = list(set(
-        spot["Gate"] + spot["MEXC"] + spot["BingX"] +
-        fut["Gate"] + fut["MEXC"] + fut["BingX"]
-    ))
+    status["counts"] = counts
+    return market_map
 
-    return exchanges, spot, fut, all_pairs
+market_map = load_markets_map()
 
-exchanges, spot_pairs, fut_pairs, all_pairs = load_pairs()
-
-def get_price(exchange, pair):
+def safe_fetch_tickers(exchange, symbols):
     try:
-        ticker = exchange.fetch_ticker(pair)
-        price = ticker.get("last")
-
-        if price is None or price <= 0:
-            return None
-
-        return float(price)
-
+        return exchange.fetch_tickers(symbols)
     except Exception:
-        return None
+        try:
+            return exchange.fetch_tickers()
+        except Exception:
+            return {}
 
-def clean_symbol(pair):
-    return pair.replace("/", "_").replace(":USDT", "")
+def get_all_prices():
+    prices = {}
 
-def make_link(exchange_name, market_type, pair):
-    symbol = clean_symbol(pair)
+    for ex_name, ex in exchanges.items():
+        spot_symbols = list(market_map[ex_name]["SPOT"].values())
+        fut_symbols = list(market_map[ex_name]["FUT"].values())
 
-    if exchange_name == "Gate" and market_type == "SPOT":
-        return f"https://www.gate.io/trade/{symbol}"
+        spot_tickers = safe_fetch_tickers(ex, spot_symbols)
+        fut_tickers = safe_fetch_tickers(ex, fut_symbols)
 
-    if exchange_name == "Gate" and market_type == "FUT":
-        return f"https://www.gate.io/futures_trade/{symbol}"
+        for key, symbol in market_map[ex_name]["SPOT"].items():
+            ticker = spot_tickers.get(symbol, {})
+            price = ticker.get("last")
+            if price and price > 0:
+                prices.setdefault(key, []).append({
+                    "exchange": ex_name,
+                    "market": "SPOT",
+                    "label": f"{ex_name} SPOT",
+                    "symbol": symbol,
+                    "price": float(price),
+                })
 
-    if exchange_name == "MEXC" and market_type == "SPOT":
-        return f"https://www.mexc.com/exchange/{symbol}"
+        for key, symbol in market_map[ex_name]["FUT"].items():
+            ticker = fut_tickers.get(symbol, {})
+            price = ticker.get("last")
+            if price and price > 0:
+                prices.setdefault(key, []).append({
+                    "exchange": ex_name,
+                    "market": "FUT",
+                    "label": f"{ex_name} FUT",
+                    "symbol": symbol,
+                    "price": float(price),
+                })
 
-    if exchange_name == "MEXC" and market_type == "FUT":
-        return f"https://www.mexc.com/futures/{symbol}"
+    return prices
 
-    if exchange_name == "BingX" and market_type == "SPOT":
-        return f"https://bingx.com/en-us/spot/{symbol}"
+def clean_symbol(symbol):
+    return symbol.replace("/", "_").replace(":USDT", "")
 
-    if exchange_name == "BingX" and market_type == "FUT":
-        return f"https://bingx.com/en-us/perpetual/{symbol}"
+def make_link(exchange, market, symbol):
+    s = clean_symbol(symbol)
+
+    if exchange == "Gate" and market == "SPOT":
+        return f"https://www.gate.io/trade/{s}"
+    if exchange == "Gate" and market == "FUT":
+        return f"https://www.gate.io/futures_trade/{s}"
+
+    if exchange == "MEXC" and market == "SPOT":
+        return f"https://www.mexc.com/exchange/{s}"
+    if exchange == "MEXC" and market == "FUT":
+        return f"https://www.mexc.com/futures/{s}"
+
+    if exchange == "BingX" and market == "SPOT":
+        return f"https://bingx.com/en-us/spot/{s}"
+    if exchange == "BingX" and market == "FUT":
+        return f"https://bingx.com/en-us/perpetual/{s}"
 
     return "#"
 
@@ -104,66 +145,49 @@ def scanner():
 
     while True:
         results = []
+        status["errors"] = []
 
-        for pair in all_pairs:
-            prices = {}
+        try:
+            all_prices = get_all_prices()
 
-            for name, ex in exchanges.items():
+            for pair, items in all_prices.items():
+                if len(items) < 2:
+                    continue
 
-                if pair in spot_pairs[name]:
-                    price = get_price(ex, pair)
-                    if price is not None and price > 0:
-                        prices[f"{name} SPOT"] = price
+                for buy in items:
+                    for sell in items:
+                        if buy["label"] == sell["label"]:
+                            continue
 
-                if pair in fut_pairs[name]:
-                    price = get_price(ex, pair)
-                    if price is not None and price > 0:
-                        prices[f"{name} FUT"] = price
+                        # Só permite SPOT x FUT e FUT x FUT
+                        if buy["market"] == "SPOT" and sell["market"] == "FUT":
+                            arb_type = "SPOT x FUT"
+                        elif buy["market"] == "FUT" and sell["market"] == "FUT":
+                            arb_type = "FUT x FUT"
+                        else:
+                            continue
 
-            valid_prices = {
-                k: v for k, v in prices.items()
-                if v is not None and v > 0
-            }
+                        spread = (sell["price"] - buy["price"]) / buy["price"] * 100
 
-            if len(valid_prices) < 2:
-                continue
+                        if MIN_SPREAD <= spread <= MAX_SPREAD:
+                            results.append({
+                                "pair": pair,
+                                "type": arb_type,
+                                "buy": buy["label"],
+                                "sell": sell["label"],
+                                "buy_price": round(buy["price"], 8),
+                                "sell_price": round(sell["price"], 8),
+                                "spread": round(spread, 2),
+                                "buy_link": make_link(buy["exchange"], buy["market"], buy["symbol"]),
+                                "sell_link": make_link(sell["exchange"], sell["market"], sell["symbol"]),
+                            })
 
-            buy_ex = min(valid_prices, key=valid_prices.get)
-            sell_ex = max(valid_prices, key=valid_prices.get)
+            data = sorted(results, key=lambda x: x["spread"], reverse=True)
+            status["last_update"] = time.strftime("%Y-%m-%d %H:%M:%S")
 
-            buy_price = valid_prices[buy_ex]
-            sell_price = valid_prices[sell_ex]
+        except Exception as e:
+            status["errors"].append(str(e))
 
-            spread = (sell_price - buy_price) / buy_price * 100
-
-            if spread < MIN_SPREAD or spread > MAX_SPREAD:
-                continue
-
-            if "SPOT" in buy_ex and "FUT" in sell_ex:
-                arb_type = "SPOT x FUT"
-
-            elif "FUT" in buy_ex and "FUT" in sell_ex:
-                arb_type = "FUT x FUT"
-
-            else:
-                continue
-
-            buy_name, buy_market = buy_ex.split()
-            sell_name, sell_market = sell_ex.split()
-
-            results.append({
-                "pair": pair,
-                "type": arb_type,
-                "buy": buy_ex,
-                "sell": sell_ex,
-                "buy_price": round(buy_price, 8),
-                "sell_price": round(sell_price, 8),
-                "spread": round(spread, 2),
-                "buy_link": make_link(buy_name, buy_market, pair),
-                "sell_link": make_link(sell_name, sell_market, pair),
-            })
-
-        data = sorted(results, key=lambda x: x["spread"], reverse=True)
         time.sleep(SCAN_INTERVAL)
 
 app = Flask(__name__)
@@ -173,47 +197,40 @@ HTML = """
 <html>
 <head>
     <title>Scanner Arbitragem</title>
-    <meta http-equiv="refresh" content="15">
+    <meta http-equiv="refresh" content="30">
     <style>
-        body {
-            font-family: Arial;
-            padding: 20px;
-            background: #111;
-            color: white;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            background: #1c1c1c;
-        }
-        th, td {
-            border: 1px solid #333;
-            padding: 8px;
-            text-align: center;
-        }
-        th {
-            background: #222;
-            color: #00ff99;
-        }
-        a {
-            color: #00ccff;
-            font-weight: bold;
-        }
-        .spread {
-            color: #ff4d4d;
-            font-weight: bold;
-        }
+        body { font-family: Arial; background:#111; color:white; padding:20px; }
+        table { width:100%; border-collapse:collapse; background:#1b1b1b; }
+        th,td { border:1px solid #333; padding:8px; text-align:center; }
+        th { background:#222; color:#00ff99; }
+        a, button { color:#00ccff; font-weight:bold; cursor:pointer; }
+        button { background:#222; border:1px solid #00ccff; padding:5px 8px; }
+        .spread { color:#ff4d4d; font-weight:bold; }
+        .box { background:#1b1b1b; padding:10px; margin-bottom:15px; border:1px solid #333; }
     </style>
+    <script>
+        function openBoth(buy, sell) {
+            window.open(buy, '_blank', 'width=900,height=900,left=0,top=0');
+            window.open(sell, '_blank', 'width=900,height=900,left=920,top=0');
+        }
+    </script>
 </head>
 <body>
     <h2>Scanner Arbitragem — Spot x Futures / Futures x Futures</h2>
 
-    <p>
-        Spread: {{min_spread}}% até {{max_spread}}% |
-        Atualiza a cada {{interval}} segundos
-    </p>
+    <div class="box">
+        <p><b>Última atualização:</b> {{status.last_update}}</p>
+        <p><b>Spread:</b> {{min_spread}}% até {{max_spread}}% | <b>Intervalo:</b> {{interval}}s</p>
+        <p><b>Oportunidades:</b> {{data|length}}</p>
 
-    <p>Oportunidades encontradas: {{data|length}}</p>
+        {% for ex, c in status.counts.items() %}
+            <p>{{ex}} — Spot: {{c.spot}} | Futuros: {{c.fut}}</p>
+        {% endfor %}
+
+        {% if status.errors %}
+            <p><b>Erros:</b> {{status.errors}}</p>
+        {% endif %}
+    </div>
 
     <table>
         <tr>
@@ -240,6 +257,8 @@ HTML = """
                 <a href="{{r.buy_link}}" target="_blank">BUY</a>
                 |
                 <a href="{{r.sell_link}}" target="_blank">SELL</a>
+                |
+                <button onclick="openBoth('{{r.buy_link}}','{{r.sell_link}}')">Lado a lado</button>
             </td>
         </tr>
         {% endfor %}
@@ -253,6 +272,7 @@ def index():
     return render_template_string(
         HTML,
         data=data,
+        status=status,
         min_spread=MIN_SPREAD,
         max_spread=MAX_SPREAD,
         interval=SCAN_INTERVAL
@@ -261,5 +281,4 @@ def index():
 threading.Thread(target=scanner, daemon=True).start()
 
 port = int(os.environ.get("PORT", 5000))
-
 app.run(host="0.0.0.0", port=port)

@@ -1,15 +1,11 @@
 import os, time, threading, ccxt
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, request
 
 MIN_SPREAD = 1
 MAX_SPREAD = 100
 SCAN_INTERVAL = 30
 
-EXCHANGE_IDS = {
-    "Gate": "gate",
-    "MEXC": "mexc",
-    "BingX": "bingx",
-}
+EXCHANGE_IDS = {"Gate": "gate", "MEXC": "mexc", "BingX": "bingx"}
 
 data = []
 status = {"last_update": "A iniciar...", "errors": [], "counts": {}}
@@ -34,27 +30,25 @@ def is_spot(market):
     return market.get("spot") is True and market.get("quote") == "USDT"
 
 def is_fut(market):
-    return (market.get("swap") is True or market.get("future") is True or market.get("contract") is True) and (
-        market.get("quote") == "USDT" or market.get("settle") == "USDT"
-    )
+    return (
+        market.get("swap") is True
+        or market.get("future") is True
+        or market.get("contract") is True
+    ) and (market.get("quote") == "USDT" or market.get("settle") == "USDT")
 
 def load_markets_map():
     market_map = {}
     counts = {}
-
     for ex_name, ex in exchanges.items():
         market_map[ex_name] = {"SPOT": {}, "FUT": {}}
-
         try:
             markets = ex.load_markets()
             for symbol, market in markets.items():
                 key = normalize_key(market)
                 if not key:
                     continue
-
                 if is_spot(market):
                     market_map[ex_name]["SPOT"][key] = symbol
-
                 if is_fut(market):
                     market_map[ex_name]["FUT"][key] = symbol
 
@@ -62,11 +56,9 @@ def load_markets_map():
                 "spot": len(market_map[ex_name]["SPOT"]),
                 "fut": len(market_map[ex_name]["FUT"]),
             }
-
         except Exception as e:
             counts[ex_name] = {"spot": 0, "fut": 0}
-            status["errors"].append(f"Erro mercados {ex_name}: {e}")
-
+            status["errors"].append(f"{ex_name}: {e}")
     status["counts"] = counts
     return market_map
 
@@ -83,7 +75,6 @@ def safe_fetch_tickers(exchange, symbols):
 
 def get_all_prices():
     prices = {}
-
     for ex_name, ex in exchanges.items():
         spot_symbols = list(market_map[ex_name]["SPOT"].values())
         fut_symbols = list(market_map[ex_name]["FUT"].values())
@@ -114,7 +105,6 @@ def get_all_prices():
                     "symbol": symbol,
                     "price": float(price),
                 })
-
     return prices
 
 def clean_symbol(symbol):
@@ -142,7 +132,6 @@ def make_link(exchange, market, symbol):
 
 def scanner():
     global data
-
     while True:
         results = []
         status["errors"] = []
@@ -159,7 +148,6 @@ def scanner():
                         if buy["label"] == sell["label"]:
                             continue
 
-                        # Só permite SPOT x FUT e FUT x FUT
                         if buy["market"] == "SPOT" and sell["market"] == "FUT":
                             arb_type = "SPOT x FUT"
                         elif buy["market"] == "FUT" and sell["market"] == "FUT":
@@ -196,17 +184,129 @@ HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Scanner Arbitragem</title>
+    <title>Arbitrage Scanner</title>
     <meta http-equiv="refresh" content="30">
     <style>
-        body { font-family: Arial; background:#111; color:white; padding:20px; }
-        table { width:100%; border-collapse:collapse; background:#1b1b1b; }
-        th,td { border:1px solid #333; padding:8px; text-align:center; }
-        th { background:#222; color:#00ff99; }
-        a, button { color:#00ccff; font-weight:bold; cursor:pointer; }
-        button { background:#222; border:1px solid #00ccff; padding:5px 8px; }
-        .spread { color:#ff4d4d; font-weight:bold; }
-        .box { background:#1b1b1b; padding:10px; margin-bottom:15px; border:1px solid #333; }
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: #0b0f19;
+            color: #e5e7eb;
+        }
+        .header {
+            padding: 20px;
+            background: #111827;
+            border-bottom: 1px solid #1f2937;
+        }
+        .title {
+            font-size: 24px;
+            font-weight: bold;
+            color: #00ff99;
+        }
+        .subtitle {
+            color: #9ca3af;
+            margin-top: 5px;
+        }
+        .cards {
+            display: flex;
+            gap: 15px;
+            padding: 20px;
+            flex-wrap: wrap;
+        }
+        .card {
+            background: #111827;
+            border: 1px solid #1f2937;
+            border-radius: 10px;
+            padding: 15px;
+            min-width: 180px;
+        }
+        .card-title {
+            color: #9ca3af;
+            font-size: 13px;
+        }
+        .card-value {
+            font-size: 22px;
+            margin-top: 6px;
+            font-weight: bold;
+        }
+        .filters {
+            padding: 0 20px 20px 20px;
+        }
+        select, input {
+            background: #111827;
+            color: white;
+            border: 1px solid #374151;
+            padding: 8px;
+            border-radius: 6px;
+            margin-right: 8px;
+        }
+        table {
+            width: calc(100% - 40px);
+            margin: 0 20px 30px 20px;
+            border-collapse: collapse;
+            background: #111827;
+            border-radius: 10px;
+            overflow: hidden;
+        }
+        th {
+            background: #1f2937;
+            color: #00ff99;
+            padding: 12px;
+            font-size: 13px;
+        }
+        td {
+            padding: 10px;
+            border-bottom: 1px solid #1f2937;
+            text-align: center;
+        }
+        tr:hover {
+            background: #172033;
+        }
+        .badge {
+            padding: 5px 8px;
+            border-radius: 20px;
+            font-weight: bold;
+            font-size: 12px;
+        }
+        .spotfut {
+            background: #064e3b;
+            color: #6ee7b7;
+        }
+        .futfut {
+            background: #312e81;
+            color: #c4b5fd;
+        }
+        .spread {
+            color: #f87171;
+            font-weight: bold;
+            font-size: 16px;
+        }
+        a {
+            color: #38bdf8;
+            text-decoration: none;
+            font-weight: bold;
+        }
+        button {
+            background: #00cc88;
+            border: none;
+            color: #001b12;
+            padding: 7px 10px;
+            border-radius: 6px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .empty {
+            margin: 20px;
+            padding: 25px;
+            background: #111827;
+            border: 1px solid #1f2937;
+            border-radius: 10px;
+            color: #fbbf24;
+        }
+        .error {
+            margin: 20px;
+            color: #f87171;
+        }
     </style>
     <script>
         function openBoth(buy, sell) {
@@ -216,21 +316,62 @@ HTML = """
     </script>
 </head>
 <body>
-    <h2>Scanner Arbitragem — Spot x Futures / Futures x Futures</h2>
+    <div class="header">
+        <div class="title">Arbitrage Scanner</div>
+        <div class="subtitle">Gate.io · MEXC · BingX | Spot x Futures / Futures x Futures</div>
+    </div>
 
-    <div class="box">
-        <p><b>Última atualização:</b> {{status.last_update}}</p>
-        <p><b>Spread:</b> {{min_spread}}% até {{max_spread}}% | <b>Intervalo:</b> {{interval}}s</p>
-        <p><b>Oportunidades:</b> {{data|length}}</p>
+    <div class="cards">
+        <div class="card">
+            <div class="card-title">Oportunidades</div>
+            <div class="card-value">{{filtered|length}}</div>
+        </div>
+
+        <div class="card">
+            <div class="card-title">Última atualização</div>
+            <div class="card-value" style="font-size:15px;">{{status.last_update}}</div>
+        </div>
+
+        <div class="card">
+            <div class="card-title">Spread</div>
+            <div class="card-value">{{min_spread}}% - {{max_spread}}%</div>
+        </div>
 
         {% for ex, c in status.counts.items() %}
-            <p>{{ex}} — Spot: {{c.spot}} | Futuros: {{c.fut}}</p>
+        <div class="card">
+            <div class="card-title">{{ex}}</div>
+            <div class="card-value" style="font-size:15px;">Spot: {{c.spot}} | Fut: {{c.fut}}</div>
+        </div>
         {% endfor %}
-
-        {% if status.errors %}
-            <p><b>Erros:</b> {{status.errors}}</p>
-        {% endif %}
     </div>
+
+    <form class="filters" method="get">
+        <select name="type">
+            <option value="">Todos os tipos</option>
+            <option value="SPOT x FUT" {% if selected_type == "SPOT x FUT" %}selected{% endif %}>SPOT x FUT</option>
+            <option value="FUT x FUT" {% if selected_type == "FUT x FUT" %}selected{% endif %}>FUT x FUT</option>
+        </select>
+
+        <select name="exchange">
+            <option value="">Todas exchanges</option>
+            <option value="Gate" {% if selected_exchange == "Gate" %}selected{% endif %}>Gate</option>
+            <option value="MEXC" {% if selected_exchange == "MEXC" %}selected{% endif %}>MEXC</option>
+            <option value="BingX" {% if selected_exchange == "BingX" %}selected{% endif %}>BingX</option>
+        </select>
+
+        <input name="pair" placeholder="Filtrar par ex: BTC" value="{{selected_pair}}">
+        <button type="submit">Filtrar</button>
+    </form>
+
+    {% if status.errors %}
+        <div class="error"><b>Erros:</b> {{status.errors}}</div>
+    {% endif %}
+
+    {% if filtered|length == 0 %}
+        <div class="empty">
+            Nenhuma oportunidade encontrada neste momento. O scanner está ativo e continuará atualizando.
+        </div>
+    {% endif %}
 
     <table>
         <tr>
@@ -241,13 +382,19 @@ HTML = """
             <th>Preço Compra</th>
             <th>Preço Venda</th>
             <th>Spread</th>
-            <th>Abrir</th>
+            <th>Ações</th>
         </tr>
 
-        {% for r in data %}
+        {% for r in filtered %}
         <tr>
-            <td>{{r.pair}}</td>
-            <td>{{r.type}}</td>
+            <td><b>{{r.pair}}</b></td>
+            <td>
+                {% if r.type == "SPOT x FUT" %}
+                    <span class="badge spotfut">{{r.type}}</span>
+                {% else %}
+                    <span class="badge futfut">{{r.type}}</span>
+                {% endif %}
+            </td>
             <td>{{r.buy}}</td>
             <td>{{r.sell}}</td>
             <td>{{r.buy_price}}</td>
@@ -258,7 +405,7 @@ HTML = """
                 |
                 <a href="{{r.sell_link}}" target="_blank">SELL</a>
                 |
-                <button onclick="openBoth('{{r.buy_link}}','{{r.sell_link}}')">Lado a lado</button>
+                <button onclick="openBoth('{{r.buy_link}}','{{r.sell_link}}')" type="button">Lado a lado</button>
             </td>
         </tr>
         {% endfor %}
@@ -269,13 +416,33 @@ HTML = """
 
 @app.route("/")
 def index():
+    selected_type = request.args.get("type", "")
+    selected_exchange = request.args.get("exchange", "")
+    selected_pair = request.args.get("pair", "").upper().strip()
+
+    filtered = data
+
+    if selected_type:
+        filtered = [r for r in filtered if r["type"] == selected_type]
+
+    if selected_exchange:
+        filtered = [
+            r for r in filtered
+            if selected_exchange in r["buy"] or selected_exchange in r["sell"]
+        ]
+
+    if selected_pair:
+        filtered = [r for r in filtered if selected_pair in r["pair"].upper()]
+
     return render_template_string(
         HTML,
-        data=data,
+        filtered=filtered,
         status=status,
         min_spread=MIN_SPREAD,
         max_spread=MAX_SPREAD,
-        interval=SCAN_INTERVAL
+        selected_type=selected_type,
+        selected_exchange=selected_exchange,
+        selected_pair=selected_pair
     )
 
 threading.Thread(target=scanner, daemon=True).start()
